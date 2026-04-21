@@ -1,0 +1,25 @@
+{
+  "name": "pi-ext-session-title",
+  "version": "0.1.0",
+  "description": "pi.dev extension that pins a user-configurable title at the top of the TUI so you can tell different pi instances apart at a glance.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "tui",
+    "session",
+    "title"
+  ],
+  "license": "MIT",
+  "private": true,
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
