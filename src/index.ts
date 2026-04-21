@@ -58,10 +58,11 @@
  *   1. Runtime override set via `/title <name>`  (highest)
  *   2. `--title "<name>"` CLI flag
  *   3. `PI_SESSION_TITLE` environment variable
- *   4. Fallback: basename of the current working directory
+ *   4. Current git branch name, if inside a repo
+ *   5. Fallback: basename of the current working directory
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { CustomEditor } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, KeybindingsManager } from "@mariozechner/pi-coding-agent";
@@ -135,6 +136,41 @@ function defaultPosition(): Surface[] {
 	const surfaces: Surface[] = ["terminal", "divider"];
 	if (process.env.TMUX) surfaces.push("tmux");
 	return surfaces;
+}
+
+// ---------------------------------------------------------------------------
+// Git branch heuristic
+// ---------------------------------------------------------------------------
+
+/**
+ * Cached result of `git rev-parse --abbrev-ref HEAD`, sniffed lazily the
+ * first time someone asks. `undefined` = not checked yet, `null` = checked
+ * and not a repo / detached HEAD, `string` = branch name.
+ *
+ * We cache across the whole process lifetime because (a) `git` spawns are
+ * not free and (b) branch changes during a pi session are rare; if they
+ * do matter, `/title` is a keystroke away.
+ */
+let cachedGitBranch: string | null | undefined;
+
+function getGitBranch(): string | undefined {
+	if (cachedGitBranch !== undefined) return cachedGitBranch ?? undefined;
+	try {
+		const out = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 500,
+			encoding: "utf8",
+		}).trim();
+		if (out.length === 0 || out === "HEAD") {
+			cachedGitBranch = null;
+			return undefined;
+		}
+		cachedGitBranch = out;
+		return out;
+	} catch {
+		cachedGitBranch = null;
+		return undefined;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +510,8 @@ export default function (pi: ExtensionAPI) {
 		if (typeof fromFlag === "string" && fromFlag.length > 0) return fromFlag;
 		const fromEnv = process.env[ENV_TITLE];
 		if (fromEnv && fromEnv.length > 0) return fromEnv;
+		const branch = getGitBranch();
+		if (branch && branch.length > 0) return branch;
 		return path.basename(process.cwd());
 	}
 
@@ -614,6 +652,9 @@ export default function (pi: ExtensionAPI) {
 			titledEditorInstalled = false;
 			editorTui = undefined;
 		}
+		// Drop cached git branch so a `reload` re-sniffs (user may have
+		// checked out a new branch in another terminal).
+		cachedGitBranch = undefined;
 	});
 
 	// ---- runtime commands -------------------------------------------------

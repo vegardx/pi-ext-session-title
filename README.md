@@ -116,7 +116,8 @@ Priority (highest first):
 1. `/title <name>` command inside pi.
 2. `--title "<name>"` CLI flag.
 3. `PI_SESSION_TITLE` env var.
-4. Fallback: basename of `cwd`.
+4. Current git branch, if inside a repo.
+5. Fallback: basename of `cwd`.
 
 ```bash
 pi --title "Prod API"
