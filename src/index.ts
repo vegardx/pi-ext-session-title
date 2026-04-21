@@ -54,16 +54,23 @@
  *                                          inside tmux (tmux owns the
  *                                          scroll region).
  *
- * Title is resolved on every `session_start` with this priority:
+ * Title is resolved on every `session_start` (and whenever a source
+ * changes) with this priority:
  *   1. Runtime override set via `/title <name>`  (highest)
  *   2. `--title "<name>"` CLI flag
  *   3. `PI_SESSION_TITLE` environment variable
- *   4. Current git branch name, if inside a repo
- *   5. Fallback: basename of the current working directory
+ *   4. LLM-generated auto-title (fires once per session, after the first
+ *      turn that either ran a tool call OR accumulated >= 500 chars of
+ *      user input). Opt out with `--no-auto-title` or
+ *      `PI_SESSION_AUTO_TITLE=0`. Force regeneration with `/retitle`.
+ *   5. Current git branch name, if inside a repo.
+ *   6. Fallback: basename of the current working directory.
  */
 
 import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
+import { completeSimple } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@mariozechner/pi-ai";
 import { CustomEditor } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, KeybindingsManager } from "@mariozechner/pi-coding-agent";
 import type { EditorTheme, TUI } from "@mariozechner/pi-tui";
@@ -76,6 +83,27 @@ import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 const ENV_TITLE = "PI_SESSION_TITLE";
 const ENV_STYLE = "PI_SESSION_TITLE_STYLE";
 const ENV_POSITION = "PI_SESSION_TITLE_POSITION";
+
+// Auto-title (LLM-generated) config env vars. See the top-of-file docstring
+// for the resolution order.
+const ENV_AUTO_TITLE = "PI_SESSION_AUTO_TITLE"; // 0/off/false/no disables
+const ENV_AUTO_TITLE_MODEL = "PI_SESSION_AUTO_TITLE_MODEL"; // "provider/id"
+const ENV_AUTO_TITLE_MODELS = "PI_SESSION_AUTO_TITLE_MODELS"; // comma list
+const ENV_AUTO_TITLE_THRESHOLD = "PI_SESSION_AUTO_TITLE_THRESHOLD_CHARS";
+
+const DEFAULT_AUTO_TITLE_THRESHOLD_CHARS = 500;
+const AUTO_TITLE_MAX_TOKENS = 40;
+const AUTO_TITLE_MAX_VISIBLE_WIDTH = 60;
+
+// Ordered from "preferred for short, cheap output" to "still fine". First
+// entry with resolved auth wins. Hard-coded lists rot; `PI_SESSION_AUTO_TITLE_MODELS`
+// env override exists exactly for that.
+const DEFAULT_AUTO_TITLE_MODELS: ReadonlyArray<readonly [string, string]> = [
+	["google", "gemini-2.5-flash"],
+	["anthropic", "claude-haiku-4-5"],
+	["openai", "gpt-5-nano"],
+	["openai", "gpt-4o-mini"],
+];
 
 const STATUS_KEY = "session-title";
 
@@ -125,21 +153,8 @@ function parsePosition(value: string | undefined): Surface[] | undefined {
 	return out.length > 0 ? out : undefined;
 }
 
-function defaultPosition(): Surface[] {
-	// Smart default:
-	//   - terminal title is always useful
-	//   - divider is Claude-Code style: a horizontal rule with the title
-	//     inlaid, sitting right above the input field. Always visible
-	//     because the editor is pinned to the viewport bottom.
-	//   - if we're in tmux, also rename the tmux window so the title
-	//     shows up in the tmux status bar (a real sticky top bar).
-	const surfaces: Surface[] = ["terminal", "divider"];
-	if (process.env.TMUX) surfaces.push("tmux");
-	return surfaces;
-}
-
 // ---------------------------------------------------------------------------
-// Git branch heuristic
+// Auto-title: zero-LLM heuristics + module-level helpers
 // ---------------------------------------------------------------------------
 
 /**
@@ -148,8 +163,8 @@ function defaultPosition(): Surface[] {
  * and not a repo / detached HEAD, `string` = branch name.
  *
  * We cache across the whole process lifetime because (a) `git` spawns are
- * not free and (b) branch changes during a pi session are rare; if they
- * do matter, `/title` is a keystroke away.
+ * not free and (b) branch changes during a pi session are rare and if they
+ * do matter the user can `/title` or `/retitle` them away.
  */
 let cachedGitBranch: string | null | undefined;
 
@@ -171,6 +186,134 @@ function getGitBranch(): string | undefined {
 		cachedGitBranch = null;
 		return undefined;
 	}
+}
+
+function parseAutoTitleThreshold(): number {
+	const raw = process.env[ENV_AUTO_TITLE_THRESHOLD];
+	if (!raw) return DEFAULT_AUTO_TITLE_THRESHOLD_CHARS;
+	const n = Number.parseInt(raw, 10);
+	return Number.isFinite(n) && n > 0 ? n : DEFAULT_AUTO_TITLE_THRESHOLD_CHARS;
+}
+
+function parseModelList(raw: string | undefined): Array<[string, string]> | undefined {
+	if (!raw) return undefined;
+	const out: Array<[string, string]> = [];
+	for (const part of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+		const idx = part.indexOf("/");
+		if (idx <= 0 || idx === part.length - 1) continue;
+		out.push([part.slice(0, idx), part.slice(idx + 1)]);
+	}
+	return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Sum the length of all `TextContent` parts in an AgentMessage's content.
+ * Mirrors the extractor in the SDK's summarize.ts example, deliberately
+ * ignoring image/tool-call parts so they don't inflate the char count and
+ * accidentally trip the threshold on purely-tool-driven turns.
+ */
+function estimateTextLength(content: unknown): number {
+	if (typeof content === "string") return content.length;
+	if (!Array.isArray(content)) return 0;
+	let total = 0;
+	for (const part of content) {
+		if (part && typeof part === "object") {
+			const p = part as { type?: string; text?: string };
+			if (p.type === "text" && typeof p.text === "string") total += p.text.length;
+		}
+	}
+	return total;
+}
+
+/** Return the first TextContent.text in a message content blob, if any. */
+function extractFirstText(content: unknown): string | undefined {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return undefined;
+	for (const part of content) {
+		if (part && typeof part === "object") {
+			const p = part as { type?: string; text?: string };
+			if (p.type === "text" && typeof p.text === "string" && p.text.length > 0) return p.text;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Clean up a raw LLM response into something presentable as a title, or
+ * return undefined if the response is unusable. Rejects empty output,
+ * stuff that's too wide for the divider, and textbook refusal patterns
+ * ("I'm sorry", "As an AI", ...) that would be confusing as a title.
+ */
+function sanitizeAutoTitle(raw: string): string | undefined {
+	let s = raw.trim();
+	const nl = s.indexOf("\n");
+	if (nl >= 0) s = s.slice(0, nl).trim();
+	s = s.replace(/\s+/g, " ");
+	// Strip wrapping quotes (ASCII + curly) and any leading/trailing
+	// punctuation the model tried to decorate the title with.
+	s = s.replace(/^["'`\u201C\u2018]+/, "").replace(/["'`\u201D\u2019]+$/, "");
+	s = s.replace(/^[\s.!?:;,\-]+/, "").replace(/[\s.!?:;,\-]+$/, "");
+	if (s.length === 0) return undefined;
+	if (visibleWidth(s) > AUTO_TITLE_MAX_VISIBLE_WIDTH) return undefined;
+	if (/\b(i\s+(?:can['\u2019]t|cannot|am\s+unable)|as\s+an\s+ai|i['\u2019]?m\s+sorry)\b/i.test(s))
+		return undefined;
+	return s;
+}
+
+function buildAutoTitlePrompt(firstPrompt: string | undefined, sawToolCall: boolean): string {
+	const trimmed = (firstPrompt ?? "").trim();
+	// Hard cap the prompt we feed in — we only need the gist, and some
+	// providers are miserly about context on nano-tier models.
+	const clipped = trimmed.length > 2000 ? `${trimmed.slice(0, 2000)}\u2026` : trimmed;
+	return [
+		"You are naming a coding-agent session so a user can tell it apart from other sessions at a glance.",
+		"",
+		"Rules:",
+		"- 2 to 5 words.",
+		"- Title Case.",
+		"- No quotes, no trailing punctuation, no emoji.",
+		'- Prefer the concrete task ("Fix Login Redirect") over the medium ("Python Help").',
+		"- If the input is vague, return a one-word topic in Title Case.",
+		"",
+		"Output ONLY the title on a single line.",
+		"",
+		"<first-prompt>",
+		clipped,
+		"</first-prompt>",
+		"",
+		`<tool-usage>${sawToolCall ? "tool calls observed" : "no tool calls yet"}</tool-usage>`,
+	].join("\n");
+}
+
+type AutoTitleStatus = "idle" | "pending" | "done" | "disabled" | "skipped";
+
+interface AutoTitleState {
+	status: AutoTitleStatus;
+	userChars: number;
+	sawToolCall: boolean;
+	firstPrompt?: string;
+	result?: string;
+}
+
+function resetAutoTitleState(state: AutoTitleState): void {
+	state.status = "idle";
+	state.userChars = 0;
+	state.sawToolCall = false;
+	state.firstPrompt = undefined;
+	state.result = undefined;
+}
+
+function defaultPosition(): Surface[] {
+	// Smart default:
+	//   - terminal title is always useful
+	//   - divider is Claude-Code style: a horizontal rule with the title
+	//     inlaid, sitting right above the input field. Always visible
+	//     because the editor is pinned to the viewport bottom.
+	//   - if we're in tmux, also rename the tmux window so the title
+	//     shows up in the tmux status bar (a real sticky top bar).
+	const surfaces: Surface[] = ["terminal", "divider"];
+	if (process.env.TMUX) surfaces.push("tmux");
+	return surfaces;
 }
 
 // ---------------------------------------------------------------------------
@@ -486,11 +629,26 @@ export default function (pi: ExtensionAPI) {
 		description: `Comma-separated list of surfaces: ${ALLOWED_SURFACES.join(",")}. Default depends on env (terminal,footer [+tmux if $TMUX]).`,
 		type: "string",
 	});
+	pi.registerFlag("no-auto-title", {
+		description: `Disable LLM-generated session title. Also disabled by $${ENV_AUTO_TITLE}=0.`,
+		type: "boolean",
+		default: false,
+	});
 
 	// Runtime overrides (in-memory, cleared on restart).
 	let titleOverride: string | undefined;
 	let styleOverride: Style | undefined;
 	let positionOverride: Surface[] | undefined;
+
+	// Auto-title: populated asynchronously after the threshold fires.
+	// Never beats `/title`, `--title`, or `$PI_SESSION_TITLE`; only sits
+	// above the git-branch / cwd fallbacks.
+	let autoTitle: string | undefined;
+	const autoTitleState: AutoTitleState = {
+		status: "idle",
+		userChars: 0,
+		sawToolCall: false,
+	};
 
 	// Shared state the `TitledEditor` reads on every render. Mutating these
 	// fields plus requesting a re-render is enough to update the divider
@@ -504,12 +662,31 @@ export default function (pi: ExtensionAPI) {
 	}
 
 
+	function hasExplicitTitle(): boolean {
+		if (titleOverride && titleOverride.length > 0) return true;
+		const fromFlag = pi.getFlag("title");
+		if (typeof fromFlag === "string" && fromFlag.length > 0) return true;
+		const fromEnv = process.env[ENV_TITLE];
+		if (fromEnv && fromEnv.length > 0) return true;
+		return false;
+	}
+
+	function isAutoTitleDisabled(): boolean {
+		// Flag is `no-auto-title` (pi convention), so `true` means disabled.
+		const flag = pi.getFlag("no-auto-title");
+		if (typeof flag === "boolean" && flag) return true;
+		const env = process.env[ENV_AUTO_TITLE]?.trim();
+		if (env && /^(0|off|false|no)$/i.test(env)) return true;
+		return false;
+	}
+
 	function resolveTitle(): string {
 		if (titleOverride && titleOverride.length > 0) return titleOverride;
 		const fromFlag = pi.getFlag("title");
 		if (typeof fromFlag === "string" && fromFlag.length > 0) return fromFlag;
 		const fromEnv = process.env[ENV_TITLE];
 		if (fromEnv && fromEnv.length > 0) return fromEnv;
+		if (autoTitle && autoTitle.length > 0) return autoTitle;
 		const branch = getGitBranch();
 		if (branch && branch.length > 0) return branch;
 		return path.basename(process.cwd());
@@ -640,8 +817,187 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	// ---- auto-title: pick a cheap model with resolved auth --------------
+	async function pickAutoTitleModel(
+		ctx: ExtensionContext,
+	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> } | undefined> {
+		const explicit = parseModelList(process.env[ENV_AUTO_TITLE_MODEL]);
+		const listEnv = parseModelList(process.env[ENV_AUTO_TITLE_MODELS]);
+		const candidates: ReadonlyArray<readonly [string, string]> =
+			explicit ?? listEnv ?? DEFAULT_AUTO_TITLE_MODELS;
+
+		for (const [provider, id] of candidates) {
+			const model = ctx.modelRegistry.find(provider, id);
+			if (!model) continue;
+			try {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				if (!auth.ok || !auth.apiKey) continue;
+				return { model, apiKey: auth.apiKey, headers: auth.headers };
+			} catch {
+				/* try next candidate */
+			}
+		}
+
+		// Last resort: the model the user is already using. This can be
+		// expensive per call but at least we know auth works, and with
+		// maxTokens=40 the cost is negligible.
+		if (ctx.model) {
+			try {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+				if (auth.ok && auth.apiKey) return { model: ctx.model, apiKey: auth.apiKey, headers: auth.headers };
+			} catch {
+				/* fall through to skipped */
+			}
+		}
+		return undefined;
+	}
+
+	async function generateAutoTitle(ctx: ExtensionContext): Promise<void> {
+		autoTitleState.status = "pending";
+		try {
+			const picked = await pickAutoTitleModel(ctx);
+			if (!picked) {
+				autoTitleState.status = "skipped";
+				return;
+			}
+			const response = await completeSimple(
+				picked.model,
+				{
+					messages: [
+						{
+							role: "user" as const,
+							content: [
+								{
+									type: "text" as const,
+									text: buildAutoTitlePrompt(autoTitleState.firstPrompt, autoTitleState.sawToolCall),
+								},
+							],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{
+					apiKey: picked.apiKey,
+					headers: picked.headers,
+					maxTokens: AUTO_TITLE_MAX_TOKENS,
+					// Reasoning models would happily burn thousands of tokens to
+					// think about a 3-word title. Titles don't need thinking.
+					// `pi-ai`'s SimpleStreamOptions ThinkingLevel doesn't include
+					// "off"; "minimal" is the cheapest portable choice.
+					reasoning: "minimal",
+					signal: ctx.signal,
+				},
+			);
+			const raw = response.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			const sanitized = sanitizeAutoTitle(raw);
+			if (!sanitized) {
+				autoTitleState.status = "skipped";
+				return;
+			}
+			// If the user set an explicit title while we were in-flight, defer
+			// to them: still record the result for a later `/title` clear, but
+			// don't repaint now — their title wins via resolveTitle().
+			autoTitle = sanitized;
+			autoTitleState.status = "done";
+			autoTitleState.result = sanitized;
+			applyTitle(ctx);
+		} catch {
+			// Silent: auto-title is quality-of-life. Next session may pick a
+			// different model / have credentials / etc.
+			autoTitleState.status = "skipped";
+		}
+	}
+
+	function maybeTriggerAutoTitle(ctx: ExtensionContext): void {
+		if (autoTitleState.status !== "idle") return;
+		// Non-interactive modes don't show titles at all (see applyTitle),
+		// so there's no point burning tokens for them.
+		if (!ctx.hasUI) {
+			autoTitleState.status = "disabled";
+			return;
+		}
+		if (isAutoTitleDisabled()) {
+			autoTitleState.status = "disabled";
+			return;
+		}
+		if (hasExplicitTitle()) {
+			// User provided one — we're done here. Note this is a per-session
+			// decision; if they later `/title` to clear, auto-title stays
+			// disabled until they explicitly `/retitle`.
+			autoTitleState.status = "disabled";
+			return;
+		}
+		const threshold = parseAutoTitleThreshold();
+		if (!autoTitleState.sawToolCall && autoTitleState.userChars < threshold) return;
+		void generateAutoTitle(ctx);
+	}
+
+	/** Seed userChars / sawToolCall / firstPrompt from replayed session history. */
+	function seedAutoTitleFromHistory(ctx: ExtensionContext): void {
+		if (autoTitleState.status !== "idle") return;
+		let branch: ReturnType<typeof ctx.sessionManager.getBranch>;
+		try {
+			branch = ctx.sessionManager.getBranch();
+		} catch {
+			return;
+		}
+		for (const entry of branch) {
+			if (entry.type !== "message") continue;
+			const msg = entry.message;
+			if (!msg || typeof msg !== "object" || !("role" in msg)) continue;
+			if (msg.role === "user") {
+				autoTitleState.userChars += estimateTextLength(msg.content);
+				if (!autoTitleState.firstPrompt) {
+					const text = extractFirstText(msg.content);
+					if (text) autoTitleState.firstPrompt = text;
+				}
+			} else if (msg.role === "assistant" && Array.isArray(msg.content)) {
+				for (const part of msg.content) {
+					if (part && typeof part === "object" && (part as { type?: string }).type === "toolCall") {
+						autoTitleState.sawToolCall = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	pi.on("session_start", async (event, ctx) => {
 		applyTitle(ctx);
+		// On resume/fork the branch already has history; seed from it so the
+		// threshold fires on the next turn instead of requiring fresh
+		// activity. On "startup" / "new" / "reload" the branch is empty
+		// (or we reset on shutdown) and this is a no-op.
+		if (event.reason === "resume" || event.reason === "fork") {
+			seedAutoTitleFromHistory(ctx);
+			maybeTriggerAutoTitle(ctx);
+		}
+	});
+
+	pi.on("before_agent_start", async (event) => {
+		if (!autoTitleState.firstPrompt && event.prompt && event.prompt.length > 0) {
+			autoTitleState.firstPrompt = event.prompt;
+		}
+	});
+
+	pi.on("message_end", async (event) => {
+		if (autoTitleState.status !== "idle") return;
+		const msg = event.message;
+		if (!msg || typeof msg !== "object" || !("role" in msg)) return;
+		if (msg.role !== "user") return;
+		autoTitleState.userChars += estimateTextLength(msg.content);
+	});
+
+	pi.on("tool_execution_start", async () => {
+		if (autoTitleState.status !== "idle") return;
+		autoTitleState.sawToolCall = true;
+	});
+
+	pi.on("turn_end", async (_event, ctx) => {
+		maybeTriggerAutoTitle(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -652,8 +1008,10 @@ export default function (pi: ExtensionAPI) {
 			titledEditorInstalled = false;
 			editorTui = undefined;
 		}
-		// Drop cached git branch so a `reload` re-sniffs (user may have
-		// checked out a new branch in another terminal).
+		// Reset auto-title state so a `reload` (which keeps the same
+		// extension runtime per session_shutdown docs) starts fresh.
+		autoTitle = undefined;
+		resetAutoTitleState(autoTitleState);
 		cachedGitBranch = undefined;
 	});
 
@@ -694,6 +1052,47 @@ export default function (pi: ExtensionAPI) {
 			styleOverride = next;
 			applyTitle(ctx);
 			ctx.ui.notify(`Style set to "${styleOverride}"`, "info");
+		},
+	});
+
+	pi.registerCommand("retitle", {
+		description: "Regenerate the auto-title via LLM (ignores the once-per-session guard)",
+		handler: async (_args, ctx) => {
+			if (isAutoTitleDisabled()) {
+				ctx.ui.notify(
+					`Auto-title is disabled (via --no-auto-title or $${ENV_AUTO_TITLE}). Enable it to use /retitle.`,
+					"warning",
+				);
+				return;
+			}
+			if (hasExplicitTitle()) {
+				ctx.ui.notify(
+					"An explicit title is set (via /title, --title, or $PI_SESSION_TITLE). Clear it first to use /retitle.",
+					"warning",
+				);
+				return;
+			}
+			// Clear the previous result and reset the state machine so the
+			// dispatcher can fire again. Keep firstPrompt / userChars / sawToolCall
+			// so we have context to work with — those are the inputs, not the
+			// output.
+			autoTitle = undefined;
+			autoTitleState.status = "idle";
+			autoTitleState.result = undefined;
+			ctx.ui.notify("Regenerating title...", "info");
+			await generateAutoTitle(ctx);
+			// Widen through a cast: TS narrows `autoTitleState.status` based
+			// on the assignments above, but `generateAutoTitle` mutates it
+			// asynchronously to "done" or "skipped".
+			const finalStatus = autoTitleState.status as AutoTitleStatus;
+			if (finalStatus === "done" && autoTitleState.result) {
+				ctx.ui.notify(`Title set to "${autoTitleState.result}"`, "info");
+			} else {
+				ctx.ui.notify(
+					"Could not generate a title (no suitable model / auth / valid response). Falling back.",
+					"warning",
+				);
+			}
 		},
 	});
 

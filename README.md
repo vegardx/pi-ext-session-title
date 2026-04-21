@@ -116,8 +116,9 @@ Priority (highest first):
 1. `/title <name>` command inside pi.
 2. `--title "<name>"` CLI flag.
 3. `PI_SESSION_TITLE` env var.
-4. Current git branch, if inside a repo.
-5. Fallback: basename of `cwd`.
+4. **Auto-generated title** (LLM, see below).
+5. Current git branch, if inside a repo.
+6. Fallback: basename of `cwd`.
 
 ```bash
 pi --title "Prod API"
@@ -125,6 +126,49 @@ PI_SESSION_TITLE="Prod API" pi
 ```
 
 Inside pi: `/title Prod API`, or `/title` to clear the override.
+
+## Auto-title
+
+If you don't set an explicit title, pi-ext-session-title will ask a small
+LLM to name the session for you after the first turn that either:
+
+- runs a tool call (`read`, `bash`, `edit`, …), **or**
+- accumulates **≥ 500 characters** of user input.
+
+Before that threshold fires, the **current git branch** (or cwd basename)
+is shown — you never see a blank title. Auto-title runs exactly once per
+session; it does not keep renaming the window as the conversation
+progresses.
+
+Auto-title never beats `/title`, `--title`, or `$PI_SESSION_TITLE`.
+
+### Knobs
+
+| Env / flag                             | Default                                              | What it does                                  |
+| -------------------------------------- | ---------------------------------------------------- | --------------------------------------------- |
+| `--no-auto-title`                      | off (auto-title enabled)                             | Opt out for this invocation.                  |
+| `PI_SESSION_AUTO_TITLE`                | `1`                                                  | Set to `0` / `off` / `false` / `no` to disable. |
+| `PI_SESSION_AUTO_TITLE_MODEL`          | unset                                                | Single `provider/id` to use, e.g. `openai/gpt-4o-mini`. Wins over the shortlist. |
+| `PI_SESSION_AUTO_TITLE_MODELS`         | unset                                                | Comma-separated `provider/id` shortlist; first one with working auth wins. |
+| `PI_SESSION_AUTO_TITLE_THRESHOLD_CHARS`| `500`                                                | User-input character threshold.               |
+
+If none of the configured / default models have credentials, auto-title
+silently skips and leaves the git-branch / cwd fallback in place.
+
+The built-in model shortlist (tried in order until one resolves auth):
+`google/gemini-2.5-flash` → `anthropic/claude-haiku-4-5` →
+`openai/gpt-5-nano` → `openai/gpt-4o-mini` → your current session model
+as a last resort.
+
+### Force regeneration
+
+```
+/retitle
+```
+
+Clears the cached auto-title and runs the LLM again using the captured
+first prompt and tool-usage signal. Useful when the first guess was a
+dud. Refuses if auto-title is disabled or an explicit title is set.
 
 ## Choosing surfaces (`--title-position`)
 
